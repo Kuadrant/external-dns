@@ -18,6 +18,8 @@ package plan
 
 import (
 	"fmt"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -35,6 +37,8 @@ type PropertyComparator func(name string, previous string, current string) bool
 type Plan struct {
 	// List of current records
 	Current []*endpoint.Endpoint
+	// List of local current records
+	CurrentLocal []*endpoint.Endpoint
 	// List of desired records
 	Desired []*endpoint.Endpoint
 	// Policies under which the desired changes are calculated
@@ -104,7 +108,8 @@ type planTableRow struct {
 	// are allowed per [RFC 1034 3.6.2]
 	//
 	// [RFC 1034 3.6.2]: https://datatracker.ietf.org/doc/html/rfc1034#autoid-15
-	current []*endpoint.Endpoint
+	current      []*endpoint.Endpoint
+	currentLocal []*endpoint.Endpoint
 	// candidates corresponds to the list of records which would like to have this dnsName.
 	candidates []*endpoint.Endpoint
 	// records is a grouping of current and candidates by record type, for example A, AAAA, CNAME.
@@ -115,7 +120,8 @@ type planTableRow struct {
 // which are desired records from the source. All records in this grouping have the same record type.
 type domainEndpoints struct {
 	// current corresponds to existing record from the registry. Maybe nil if no current record of the type exists.
-	current *endpoint.Endpoint
+	current      *endpoint.Endpoint
+	currentLocal *endpoint.Endpoint
 	// candidates corresponds to the list of records which would like to have this dnsName.
 	candidates []*endpoint.Endpoint
 }
@@ -128,6 +134,12 @@ func (t planTable) addCurrent(e *endpoint.Endpoint) {
 	key := t.newPlanKey(e)
 	t.rows[key].current = append(t.rows[key].current, e)
 	t.rows[key].records[e.RecordType].current = e
+}
+
+func (t planTable) addCurrentLocal(e *endpoint.Endpoint) {
+	key := t.newPlanKey(e)
+	t.rows[key].currentLocal = append(t.rows[key].currentLocal, e)
+	t.rows[key].records[e.RecordType].currentLocal = e
 }
 
 func (t planTable) addCandidate(e *endpoint.Endpoint) {
@@ -162,6 +174,8 @@ func (c *Changes) HasChanges() bool {
 	return !cmp.Equal(c.UpdateNew, c.UpdateOld)
 }
 
+const ownerDeliminator = ";;"
+
 // Calculate computes the actions needed to move current state towards desired
 // state. It then passes those changes to the current policy for further
 // processing. It returns a copy of Plan with the changes populated.
@@ -174,6 +188,9 @@ func (p *Plan) Calculate() *Plan {
 
 	for _, current := range filterRecordsForPlan(p.Current, p.DomainFilter, p.ManagedRecords, p.ExcludeRecords) {
 		t.addCurrent(current)
+	}
+	for _, currentLocal := range filterRecordsForPlan(p.CurrentLocal, p.DomainFilter, p.ManagedRecords, p.ExcludeRecords) {
+		t.addCurrentLocal(currentLocal)
 	}
 	for _, desired := range filterRecordsForPlan(p.Desired, p.DomainFilter, p.ManagedRecords, p.ExcludeRecords) {
 		t.addCandidate(desired)
@@ -194,7 +211,43 @@ func (p *Plan) Calculate() *Plan {
 
 		// dns name released or possibly owned by a different external dns
 		if len(row.current) > 0 && len(row.candidates) == 0 {
-			changes.Delete = append(changes.Delete, row.current...)
+			if len(row.currentLocal) > 0 {
+				recordsByType := t.resolver.ResolveRecordTypes(key, row)
+				for _, records := range recordsByType {
+					// update existing record
+					if records.current != nil && records.currentLocal != nil {
+						//ToDo This is assuming that each record adds different targets which is not always true
+						candidate := records.current.DeepCopy()
+						owners := []string{}
+						if endpointOwner, ok := records.current.Labels[endpoint.OwnerLabelKey]; ok {
+							owners = strings.Split(endpointOwner, ownerDeliminator)
+							for i, v := range owners {
+								if v == p.OwnerID {
+									owners = append(owners[:i], owners[i+1:]...)
+									break
+								}
+							}
+							candidate.Labels[endpoint.OwnerLabelKey] = strings.Join(owners, ownerDeliminator)
+						}
+
+						if len(owners) == 0 {
+							changes.Delete = append(changes.Delete, records.current)
+							continue
+						}
+
+						//Hacky, if multiple records are adding the same single target then we can't remove it
+						if len(candidate.Targets) > 1 {
+							removeEndpoint(records.currentLocal, candidate)
+						}
+
+						changes.UpdateOld = append(changes.UpdateOld, records.current)
+						changes.UpdateNew = append(changes.UpdateNew, candidate)
+					}
+				}
+			} else {
+				//If we have no local copy add it to delete changes
+				changes.Delete = append(changes.Delete, row.current...)
+			}
 		}
 
 		// dns name is taken
@@ -222,8 +275,21 @@ func (p *Plan) Calculate() *Plan {
 				if records.current != nil && len(records.candidates) > 0 {
 					update := t.resolver.ResolveUpdate(records.current, records.candidates)
 
-					if shouldUpdateTTL(update, records.current) || targetChanged(update, records.current) || p.shouldUpdateProviderSpecific(update, records.current) {
-						inheritOwner(records.current, update)
+					candidate := records.current.DeepCopy()
+					if records.currentLocal != nil {
+						removeEndpoint(records.currentLocal, candidate)
+					}
+					mergeEndpoint(update, candidate)
+					if endpointOwner, hasOwner := candidate.Labels[endpoint.OwnerLabelKey]; hasOwner {
+						owners := strings.Split(endpointOwner, ownerDeliminator)
+						owners = append(owners, p.OwnerID)
+						owners = slices.Compact[[]string, string](owners)
+						slices.Sort(owners)
+						candidate.Labels[endpoint.OwnerLabelKey] = strings.Join(owners, ownerDeliminator)
+					}
+					inheritOwner(candidate, update)
+
+					if !reflect.DeepEqual(update.Labels, records.current.Labels) || shouldUpdateTTL(update, records.current) || targetChanged(update, records.current) || p.shouldUpdateProviderSpecific(update, records.current) {
 						changes.UpdateNew = append(changes.UpdateNew, update)
 						changes.UpdateOld = append(changes.UpdateOld, records.current)
 					}
@@ -253,8 +319,8 @@ func (p *Plan) Calculate() *Plan {
 	// filter out updates this external dns does not have ownership claim over
 	if p.OwnerID != "" {
 		changes.Delete = endpoint.FilterEndpointsByOwnerID(p.OwnerID, changes.Delete)
-		changes.UpdateOld = endpoint.FilterEndpointsByOwnerID(p.OwnerID, changes.UpdateOld)
-		changes.UpdateNew = endpoint.FilterEndpointsByOwnerID(p.OwnerID, changes.UpdateNew)
+		//changes.UpdateOld = endpoint.FilterEndpointsByOwnerID(p.OwnerID, changes.UpdateOld)
+		//changes.UpdateNew = endpoint.FilterEndpointsByOwnerID(p.OwnerID, changes.UpdateNew)
 	}
 
 	plan := &Plan{
@@ -275,6 +341,34 @@ func inheritOwner(from, to *endpoint.Endpoint) {
 		from.Labels = map[string]string{}
 	}
 	to.Labels[endpoint.OwnerLabelKey] = from.Labels[endpoint.OwnerLabelKey]
+}
+
+func removeEndpoint(undesired, candidate *endpoint.Endpoint) {
+	undesiredMap := map[string]string{}
+	for idx := range undesired.Targets {
+		undesiredMap[undesired.Targets[idx]] = undesired.Targets[idx]
+	}
+	desiredTargets := []string{}
+	for idx := range candidate.Targets {
+		if _, ok := undesiredMap[candidate.Targets[idx]]; ok {
+			candidate.DeleteProviderSpecificProperty(candidate.Targets[idx])
+		} else {
+			desiredTargets = append(desiredTargets, candidate.Targets[idx])
+		}
+	}
+	candidate.Targets = desiredTargets
+}
+
+func mergeEndpoint(desired, current *endpoint.Endpoint) {
+	desired.Targets = append(desired.Targets, current.Targets...)
+	slices.Sort(desired.Targets)
+	desired.Targets = slices.Compact[[]string, string](desired.Targets)
+	for idx := range desired.Targets {
+		if val, ok := current.GetProviderSpecificProperty(desired.Targets[idx]); ok {
+			desired.DeleteProviderSpecificProperty(desired.Targets[idx])
+			desired.SetProviderSpecificProperty(desired.Targets[idx], val)
+		}
+	}
 }
 
 func targetChanged(desired, current *endpoint.Endpoint) bool {

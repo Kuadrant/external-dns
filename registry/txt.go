@@ -220,16 +220,16 @@ func (im *TXTRegistry) generateTXTRecord(r *endpoint.Endpoint) []*endpoint.Endpo
 
 	endpoints := make([]*endpoint.Endpoint, 0)
 
-	if !im.txtEncryptEnabled && !im.mapper.recordTypeInAffix() && r.RecordType != endpoint.RecordTypeAAAA {
-		// old TXT record format
-		txt := endpoint.NewEndpoint(im.mapper.toTXTName(r.DNSName), endpoint.RecordTypeTXT, r.Labels.Serialize(true, im.txtEncryptEnabled, im.txtEncryptAESKey))
-		if txt != nil {
-			txt.WithSetIdentifier(r.SetIdentifier)
-			txt.Labels[endpoint.OwnedRecordLabelKey] = r.DNSName
-			txt.ProviderSpecific = r.ProviderSpecific
-			endpoints = append(endpoints, txt)
-		}
-	}
+	//if !im.txtEncryptEnabled && !im.mapper.recordTypeInAffix() && r.RecordType != endpoint.RecordTypeAAAA {
+	//	// old TXT record format
+	//	txt := endpoint.NewEndpoint(im.mapper.toTXTName(r.DNSName), endpoint.RecordTypeTXT, r.Labels.Serialize(true, im.txtEncryptEnabled, im.txtEncryptAESKey))
+	//	if txt != nil {
+	//		txt.WithSetIdentifier(r.SetIdentifier)
+	//		txt.Labels[endpoint.OwnedRecordLabelKey] = r.DNSName
+	//		txt.ProviderSpecific = r.ProviderSpecific
+	//		endpoints = append(endpoints, txt)
+	//	}
+	//}
 	// new TXT record format (containing record type)
 	recordType := r.RecordType
 	// AWS Alias records are encoded as type "cname"
@@ -252,8 +252,8 @@ func (im *TXTRegistry) generateTXTRecord(r *endpoint.Endpoint) []*endpoint.Endpo
 func (im *TXTRegistry) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	filteredChanges := &plan.Changes{
 		Create:    changes.Create,
-		UpdateNew: endpoint.FilterEndpointsByOwnerID(im.ownerID, changes.UpdateNew),
-		UpdateOld: endpoint.FilterEndpointsByOwnerID(im.ownerID, changes.UpdateOld),
+		UpdateNew: changes.UpdateNew,
+		UpdateOld: changes.UpdateOld,
 		Delete:    endpoint.FilterEndpointsByOwnerID(im.ownerID, changes.Delete),
 	}
 	for _, r := range filteredChanges.Create {
