@@ -198,6 +198,11 @@ func (p *Plan) Calculate() *Plan {
 
 	changes := &Changes{}
 
+	//ToDo Map current owners and DNSNames so we can check how many there are for each. During removal below if we get to a point where a CNAME will have no owners we wil be able to remove it.
+	// 1. Get CNAME Targets
+	// 2. Check if targets exist in current list
+	// 3. If it exists append owner to owner list for this DNSName
+
 	for key, row := range t.rows {
 		// dns name not taken
 		if len(row.current) == 0 {
@@ -217,6 +222,8 @@ func (p *Plan) Calculate() *Plan {
 					// update existing record
 					if records.current != nil && records.currentLocal != nil {
 						//ToDo This is assuming that each record adds different targets which is not always true
+						// This should check owners map (described above) to check if it's still going to be owned once we remove this endpoint.
+						// This is the "dead end" stuff that is in the RFC.
 						candidate := records.current.DeepCopy()
 						owners := []string{}
 						if endpointOwner, ok := records.current.Labels[endpoint.OwnerLabelKey]; ok {
